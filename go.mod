@@ -2,7 +2,10 @@ module example.com/ryeremotes
 
 go 1.26.1
 
-require github.com/refaktor/rye v0.2.61
+require (
+	github.com/refaktor/rye v0.2.61
+	golang.org/x/crypto v0.52.0
+)
 
 require (
 	filippo.io/age v1.3.1 // indirect
@@ -97,7 +100,6 @@ require (
 	go.opentelemetry.io/otel/metric v1.43.0 // indirect
 	go.opentelemetry.io/otel/trace v1.43.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.3 // indirect
-	golang.org/x/crypto v0.52.0 // indirect
 	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.45.0 // indirect
