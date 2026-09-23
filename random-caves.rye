@@ -1,0 +1,6 @@
+var 'health 3
+var 'riches 0
+
+look: does { ^if health < 1 { print "You are dead, eyes don't work" } random { "beast" "gold" "water" "megabeast" } }
+fight: fn { x } { .contains "beast" |either { either x = "megabeast" { change! 0 'health , print "You are dead" } { print "You survive!" } } { dec! 'health , print "You hit yourself, you clumz" } }
+pickup: fn { x } { .switch { "gold" { inc! 'riches } "water" { inc! 'health } _ { change! 0 'health } } }

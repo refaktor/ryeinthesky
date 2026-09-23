@@ -1,0 +1,16 @@
+concat: ?concat
+print: ?print
+loop: ?loop
+
+var 'soma empty
+
+say-hi: fn { n } { .embed "Hi {}!" |print }
+
+start-somafm: does {
+	s: cmd {
+		mpv --no-video --no-terminal --really-quiet http://ice1.somafm.com/defcon-128-aac
+	}
+	|Detach!
+	|Start |change! 'soma }
+	
+stop-somafm: does { soma .Kill }
