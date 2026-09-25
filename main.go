@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 	"sort"
+	"regexp"
 
 	"golang.org/x/crypto/ssh"
 
@@ -45,7 +46,7 @@ type Server struct {
 	allowedKeys map[string]ed25519.PublicKey
 	// map of key-id -> P-256 public key
 	allowedP256 map[string]P256Pub
-	sessions    map[string]*Session // identity (ed25519:<b64> or p256:<key-id>) -> session
+	sessions    map[string]map[string]*Session // identity -> name -> session
 	mu          sync.RWMutex
 	sharedIdx   *env.Idxs
 	sharedGen   *env.Gen
@@ -126,7 +127,7 @@ func main() {
 	server := &Server{
 		allowedKeys: allowedKeys,
 		allowedP256: allowedP256,
-		sessions:    make(map[string]*Session),
+		sessions:    make(map[string]map[string]*Session),
 		sharedIdx:   basePs.Idx,
 		sharedGen:   basePs.Gen,
 		rootCtx:     rootCtx,
@@ -357,7 +358,7 @@ func jsonOK(w http.ResponseWriter, data interface{}) {
 	json.NewEncoder(w).Encode(data)
 }
 
-// handleSession handles POST /session (create) and DELETE /session (close)
+// handleSession handles POST /session (create named) and DELETE /session (close named)
 func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	// Read body first (needed for signature verification)
 	body, _ := io.ReadAll(r.Body)
@@ -369,13 +370,31 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var req struct{ Name string `json:"name"` }
+	if r.Method == http.MethodPost || r.Method == http.MethodDelete {
+		if err := json.Unmarshal(body, &req); err != nil || strings.TrimSpace(req.Name) == "" {
+			jsonError(w, "invalid or missing name", http.StatusBadRequest)
+			return
+		}
+		// validate name
+		if !validSessionName(req.Name) {
+			jsonError(w, "invalid name: use 1-64 chars [A-Za-z0-9._-]", http.StatusBadRequest)
+			return
+		}
+	}
+
 	switch r.Method {
 	case http.MethodPost:
-		// Create session
+		// Create named session under identity
 		s.mu.Lock()
-		if _, exists := s.sessions[identity]; exists {
+		m, ok := s.sessions[identity]
+		if !ok {
+			m = make(map[string]*Session)
+			s.sessions[identity] = m
+		}
+		if _, exists := m[req.Name]; exists {
 			s.mu.Unlock()
-			jsonError(w, "session already exists, close it first", http.StatusBadRequest)
+			jsonError(w, "session with this name already exists", http.StatusConflict)
 			return
 		}
 
@@ -393,49 +412,62 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 			Dialect:     env.Rye2Dialect,
 		}
 
-		s.sessions[identity] = &Session{ps: ps}
+		m[req.Name] = &Session{ps: ps}
 		s.mu.Unlock()
 
-		fmt.Printf("Session created for %s\n", identity)
-		jsonOK(w, map[string]string{"message": "session created"})
+		fmt.Printf("Session created for %s name=%s\n", identity, req.Name)
+		jsonOK(w, map[string]string{"message": "session created", "name": req.Name})
 
 	case http.MethodDelete:
-		// Close session
+		// Close named session
 		s.mu.Lock()
-		if _, exists := s.sessions[identity]; !exists {
+		m, ok := s.sessions[identity]
+		if !ok {
 			s.mu.Unlock()
-			jsonError(w, "no session exists", http.StatusBadRequest)
+			jsonError(w, "no sessions for identity", http.StatusBadRequest)
 			return
 		}
-		delete(s.sessions, identity)
+		if _, exists := m[req.Name]; !exists {
+			s.mu.Unlock()
+			jsonError(w, "no such session", http.StatusNotFound)
+			return
+		}
+		delete(m, req.Name)
+		if len(m) == 0 { delete(s.sessions, identity) }
 		s.mu.Unlock()
 
-		fmt.Printf("Session closed for %s\n", identity)
-		jsonOK(w, map[string]string{"message": "session closed"})
+		fmt.Printf("Session closed for %s name=%s\n", identity, req.Name)
+		jsonOK(w, map[string]string{"message": "session closed", "name": req.Name})
 
 	default:
 		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
-// handleList handles GET /list and returns available words in current context for the caller's session
+// handleList handles POST /list and returns available words in current context for the caller's named session
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
+	if r.Method != http.MethodPost {
 		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	// No body, but we still need to sign the request without body
-	identity, err := s.verifyRequestAny(r, nil)
+	body, _ := io.ReadAll(r.Body)
+	identity, err := s.verifyRequestAny(r, body)
 	if err != nil {
 		jsonError(w, "unauthorized: "+err.Error(), http.StatusUnauthorized)
 		return
 	}
+	var req struct{ Name string `json:"name"` }
+	if err := json.Unmarshal(body, &req); err != nil || strings.TrimSpace(req.Name) == "" || !validSessionName(req.Name) {
+		jsonError(w, "invalid or missing name", http.StatusBadRequest)
+		return
+	}
 	// Get session (required so list reflects session context)
 	s.mu.RLock()
-	session, exists := s.sessions[identity]
+	m := s.sessions[identity]
+	session, exists := m[req.Name]
 	s.mu.RUnlock()
 	if !exists {
-		jsonError(w, "no session, create one first", http.StatusBadRequest)
+		jsonError(w, "no such session", http.StatusNotFound)
 		return
 	}
 	// Collect words from current context using lc\data behavior
@@ -502,22 +534,23 @@ func (s *Server) handleEval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Parse request
+	var req struct {
+		Name string `json:"name"`
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil || strings.TrimSpace(req.Name) == "" || !validSessionName(req.Name) {
+		jsonError(w, "invalid request body or missing/invalid name", http.StatusBadRequest)
+		return
+	}
 	// Get session
 	s.mu.RLock()
-	session, exists := s.sessions[identity]
+	m := s.sessions[identity]
+	session, exists := m[req.Name]
 	s.mu.RUnlock()
 
 	if !exists {
-		jsonError(w, "no session, create one first", http.StatusBadRequest)
-		return
-	}
-
-	// Parse request
-	var req struct {
-		Code string `json:"code"`
-	}
-	if err := json.Unmarshal(body, &req); err != nil {
-		jsonError(w, "invalid request body", http.StatusBadRequest)
+		jsonError(w, "no such session", http.StatusNotFound)
 		return
 	}
 
@@ -585,3 +618,7 @@ func (s *Server) handleEval(w http.ResponseWriter, r *http.Request) {
 
 	jsonOK(w, resp)
 }
+
+// validSessionName enforces a safe, simple session name policy
+var sessionNameRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+func validSessionName(name string) bool { return sessionNameRe.MatchString(name) }
